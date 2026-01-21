@@ -2,13 +2,32 @@
 
 A comprehensive guide to implementing OAuth with Wix for third-party applications.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Understanding the Token Identity](#understanding-the-token-identity)
+- [OAuth Flow (Simplified)](#oauth-flow-simplified)
+  - [Flow Diagram](#oauth-flow-diagram)
+  - [Implementation Steps](#implementation-steps)
+  - [Complete Express.js Example](#complete-expressjs-example)
+- [Token Management](#token-management)
+  - [Token Creation Service](#token-creation-service)
+  - [Getting Valid Access Tokens](#getting-valid-access-tokens)
+  - [Getting Site Information](#getting-site-information-optional)
+- [Security Considerations](#security-considerations)
+- [Troubleshooting](#troubleshooting)
+- [Legacy OAuth Flow](./LEGACY_OAUTH_FLOW.md)
+- [References](#references)
+
+---
+
 ## Overview
 
-Wix uses a unique OAuth flow called **Custom Authentication (Legacy)** that differs from standard OAuth providers. The key differences are:
+Wix provides a **simplified OAuth flow** that makes it easy to integrate your application with Wix sites. The key characteristics are:
 
-1. **Two-step redirect flow**: Wix requires an intermediate redirect through your "App URL" before the final authorization
-2. **Token parameter**: Wix sends a `token` parameter to your App URL that must be passed back to the installer
-3. **Instance-based tokens**: Wix uses `instance_id` + `client_credentials` grant instead of traditional refresh tokens
+1. **Single redirect flow**: Direct redirect to the callback URL after installation
+2. **Dynamic callback URL**: Specify your `postInstallationUrl` at runtime (no pre-configuration needed)
+3. **Instance-based tokens**: Uses `instance_id` + `client_credentials` grant for token retrieval
 4. **Dashboard-defined scopes**: Permissions are defined in the Wix app dashboard, not per-request
 
 > **Important Note**: Wix does not support reduced scopes. The user must approve all permissions defined in your app dashboard. You cannot request a subset of permissions during OAuth.
@@ -45,7 +64,11 @@ This app identity token is **not designed for live site visitor actions** such a
 
 ---
 
-## OAuth Flow Diagram
+## OAuth Flow (Simplified)
+
+The simplified OAuth flow requires only **two steps**: initiate the installation and handle the callback. No intermediate redirects or token passing required!
+
+### OAuth Flow Diagram
 
 ```
 User clicks "Connect Wix"
@@ -53,44 +76,39 @@ User clicks "Connect Wix"
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ Step 1: Your App Initiates Connection                           │
-│  - Store pending connection info (app context, user, etc.)      │
-│  - Redirect to: https://www.wix.com/installer/install?appId=X   │
+│  - Build the installer URL with your appId and postInstallationUrl
+│  - Redirect to: https://www.wix.com/app-installer?appId=X&      │
+│                 postInstallationUrl=YOUR_CALLBACK_URL           │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Wix Installer (external)                                        │
+│ Wix App Installer (external)                                    │
 │  - User selects which Wix site to install app on                │
-│  - Wix redirects to your "App URL" with a `token` parameter     │
-└─────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 2: Your App URL Endpoint                                   │
-│  - Receive `token` parameter from Wix                           │
-│  - Redirect back to Wix installer with:                         │
-│    • token (received from Wix)                                  │
-│    • appId (your Wix app ID)                                    │
-│    • redirectUrl (your final callback URL)                      │
-└─────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Wix Installer (external)                                        │
 │  - User reviews and approves permissions                        │
-│  - Wix redirects to your redirectUrl with:                      │
-│    • code (authorization code)                                  │
-│    • instanceId (unique site identifier)                        │
+│  - Wix redirects to your postInstallationUrl with:              │
+│    • appId (your Wix app ID)                                    │
+│    • tenantId (the Wix tenant/site that installed the app)      │
+│    • instanceId (unique ID for this app installation)           │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Step 3: Your Callback Endpoint                                  │
+│ Step 2: Your Callback Endpoint                                  │
 │  - Use instanceId to create access token (client_credentials)   │
 │  - Store instanceId securely for future token creation          │
 │  - Complete the OAuth flow (close popup, redirect, etc.)        │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Key Advantages Over Legacy Flow
+
+| Feature | Simplified Flow | Legacy Flow |
+|---------|-----------------|-------------|
+| Redirect steps | 1 (direct to callback) | 2 (App URL → Installer → Callback) |
+| URL configuration in Dev Center | Not required | Required (App URL + Redirect URL) |
+| State parameter support | Built-in via query params | Manual session management |
+| Token passing | Not required | Required (must pass token back) |
 
 ---
 
@@ -99,12 +117,11 @@ User clicks "Connect Wix"
 ### 1. Wix App Setup (Wix Developer Dashboard)
 
 1. Create a new app at [Wix Developer Dashboard](https://manage.wix.com/studio/custom-apps)
-2. Configure OAuth settings (Develop -> OAuth):
-   - **App URL**: Your endpoint that receives the initial redirect with `token` (e.g., `https://yourapp.com/wix/install`)
-   - **Redirect URL**: Your final callback endpoint (e.g., `https://yourapp.com/wix/callback`)
-   - Note your **App ID** and **App Secret**
-3. Define required permissions in the app dashboard (Develop -> Permissions). These cannot be reduced per-request
-4. Release a version of the app (Distribute -> App distribution)
+2. Note your **App ID** and **App Secret** (Develop → OAuth)
+3. Define required permissions in the app dashboard (Develop → Permissions)
+4. Release a version of the app (Distribute → App distribution)
+
+> **Note**: Unlike the legacy flow, you do **not** need to configure App URL or Redirect URL in the dashboard!
 
 ### 2. Environment Configuration
 
@@ -117,72 +134,64 @@ WIX_APP_SECRET=your_wix_app_secret
 
 #### 3.1 Initiate OAuth Flow
 
-Redirect the user to the Wix installer:
+Redirect the user to the Wix App Installer with your callback URL:
 
 ```javascript
-// Wix OAuth endpoints
-const WIX_INSTALLER_URL = 'https://www.wix.com/installer/install';
+// Wix App Installer URL
+const WIX_APP_INSTALLER_URL = 'https://www.wix.com/app-installer';
 
 function initiateWixOAuth(req, res) {
   const appId = process.env.WIX_APP_ID;
-  
-  // Store any context you need (user session, app context, etc.)
-  // This could be in a session, database, or signed cookie
-  req.session.pendingWixConnection = {
-    userId: req.user.id,
-    initiatedAt: Date.now()
-  };
-  
-  // Redirect to Wix installer
-  const installerUrl = `${WIX_INSTALLER_URL}?appId=${appId}`;
-  res.redirect(installerUrl);
-}
-```
-
-#### 3.2 App URL Endpoint (Receives Token from Wix)
-
-This is the endpoint configured as "App URL" in your Wix dashboard. Wix redirects here with a `token` parameter after the user selects a site:
-
-```javascript
-function handleWixInstallInit(req, res) {
-  const { token } = req.query;
-  
-  if (!token) {
-    return res.status(400).send('Missing token from Wix');
-  }
-  
-  // Verify you have a pending connection (optional but recommended)
-  if (!req.session.pendingWixConnection) {
-    return res.status(400).send('No pending connection found');
-  }
-  
-  const appId = process.env.WIX_APP_ID;
   const callbackUrl = `${process.env.BASE_URL}/wix/callback`;
   
-  // Build redirect URL back to Wix with all required parameters
-  const params = new URLSearchParams({
-    token: token,           // The token received from Wix - REQUIRED
-    appId: appId,           // Your Wix app ID
-    redirectUrl: callbackUrl // Where Wix will redirect after approval
+  // You can include any state information in the callback URL
+  // This is useful for tracking the user or session that initiated the flow
+  const state = encryptState({
+    userId: req.user.id,
+    initiatedAt: Date.now(),
+    returnTo: req.query.returnTo || '/dashboard'
   });
   
-  const redirectUrl = `${WIX_INSTALLER_URL}?${params.toString()}`;
-  res.redirect(redirectUrl);
+  // Build the callback URL with your state
+  const postInstallationUrl = new URL(callbackUrl);
+  postInstallationUrl.searchParams.set('state', state);
+  
+  // Build the installer URL
+  const installerUrl = new URL(WIX_APP_INSTALLER_URL);
+  installerUrl.searchParams.set('appId', appId);
+  installerUrl.searchParams.set('postInstallationUrl', postInstallationUrl.toString());
+  
+  res.redirect(installerUrl.toString());
+}
+
+// Helper function to encrypt state (implement your own encryption)
+function encryptState(data) {
+  // Use a proper encryption library in production (e.g., crypto-js, jose)
+  return Buffer.from(JSON.stringify(data)).toString('base64url');
 }
 ```
 
-> **Critical**: The `token` parameter received from Wix must be passed back to the installer. This token identifies the installation session and is required for the flow to complete.
+#### 3.2 Callback Endpoint
 
-#### 3.3 Final Callback Endpoint
-
-After the user approves permissions, Wix redirects to your callback URL with `code` and `instanceId`:
+After the user approves permissions, Wix redirects to your `postInstallationUrl` with additional parameters:
 
 ```javascript
 async function handleWixCallback(req, res) {
-  const { code, instanceId } = req.query;
+  const { appId, tenantId, instanceId, state } = req.query;
   
-  if (!code || !instanceId) {
-    return res.status(400).send('Missing authorization parameters');
+  if (!instanceId) {
+    return res.status(400).send('Missing instanceId from Wix');
+  }
+  
+  // Decrypt and validate your state (if you included one)
+  let stateData = null;
+  if (state) {
+    try {
+      stateData = decryptState(state);
+      // Optionally validate state (check timestamp, etc.)
+    } catch (error) {
+      return res.status(400).send('Invalid state parameter');
+    }
   }
   
   try {
@@ -192,16 +201,17 @@ async function handleWixCallback(req, res) {
     // Store the instanceId securely - you'll need it to create new tokens
     // The instanceId is permanent for this app+site combination
     await saveWixConnection({
-      instanceId: instanceId,  // Store this securely (encrypted)
+      instanceId: instanceId,        // Store this securely (encrypted)
+      tenantId: tenantId,            // The Wix site/tenant ID
+      appId: appId,                  // Your app ID (for reference)
       accessToken: tokenData.accessToken,
       expiresAt: tokenData.expiresAt,
-      userId: req.session.pendingWixConnection?.userId
+      userId: stateData?.userId      // From your encrypted state
     });
     
-    // Clear pending connection
-    delete req.session.pendingWixConnection;
-    
     // Complete the flow (close popup, redirect to success page, etc.)
+    const returnTo = stateData?.returnTo || '/dashboard?connected=wix';
+    
     res.send(`
       <html>
         <body>
@@ -210,7 +220,7 @@ async function handleWixCallback(req, res) {
               window.opener.postMessage({ status: 'success', type: 'wix-oauth' }, '*');
               window.close();
             } else {
-              window.location.href = '/dashboard?connected=wix';
+              window.location.href = '${returnTo}';
             }
           </script>
           <p>Connected successfully! You can close this window.</p>
@@ -223,9 +233,116 @@ async function handleWixCallback(req, res) {
     res.status(500).send('Failed to complete Wix authorization');
   }
 }
+
+// Helper function to decrypt state
+function decryptState(encrypted) {
+  // Use a proper decryption library in production
+  return JSON.parse(Buffer.from(encrypted, 'base64url').toString());
+}
 ```
 
-### 4. Token Creation Service
+### Callback Parameters
+
+When Wix redirects to your `postInstallationUrl`, it appends the following query parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `appId` | Your Wix application ID |
+| `tenantId` | The Wix tenant (site) that installed the app |
+| `instanceId` | A unique ID for this app installation, used to retrieve access tokens |
+
+Additionally, any query parameters you included in your `postInstallationUrl` will be preserved (e.g., your `state` parameter).
+
+---
+
+## Complete Express.js Example
+
+```javascript
+const express = require('express');
+
+const app = express();
+
+const WIX_APP_INSTALLER_URL = 'https://www.wix.com/app-installer';
+const WIX_TOKEN_URL = 'https://www.wixapis.com/oauth2/token';
+
+// Step 1: Initiate OAuth
+app.get('/wix/connect', (req, res) => {
+  const appId = process.env.WIX_APP_ID;
+  const callbackUrl = `${process.env.BASE_URL}/wix/callback`;
+  
+  // Include state in the callback URL
+  const state = Buffer.from(JSON.stringify({
+    userId: req.user?.id,
+    initiatedAt: Date.now()
+  })).toString('base64url');
+  
+  const postInstallationUrl = `${callbackUrl}?state=${state}`;
+  
+  const installerUrl = new URL(WIX_APP_INSTALLER_URL);
+  installerUrl.searchParams.set('appId', appId);
+  installerUrl.searchParams.set('postInstallationUrl', postInstallationUrl);
+  
+  res.redirect(installerUrl.toString());
+});
+
+// Step 2: Handle callback
+app.get('/wix/callback', async (req, res) => {
+  const { appId, tenantId, instanceId, state } = req.query;
+  
+  if (!instanceId) {
+    return res.status(400).send('Missing instanceId');
+  }
+  
+  // Decode state
+  let stateData = {};
+  if (state) {
+    try {
+      stateData = JSON.parse(Buffer.from(state, 'base64url').toString());
+    } catch (e) {
+      console.error('Failed to decode state:', e);
+    }
+  }
+  
+  try {
+    // Create access token
+    const tokenResponse = await fetch(WIX_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'client_credentials',
+        client_id: process.env.WIX_APP_ID,
+        client_secret: process.env.WIX_APP_SECRET,
+        instance_id: instanceId
+      })
+    });
+    
+    const tokenData = await tokenResponse.json();
+    
+    // Store connection (implement your own storage)
+    await saveConnection({
+      instanceId,
+      tenantId,
+      accessToken: tokenData.access_token,
+      expiresAt: new Date(Date.now() + 4 * 60 * 60 * 1000),
+      userId: stateData.userId
+    });
+    
+    res.send('<script>window.close()</script>Connected!');
+    
+  } catch (error) {
+    console.error('Wix OAuth error:', error);
+    res.status(500).send('Authorization failed');
+  }
+});
+
+app.listen(3000);
+```
+
+---
+
+## Token Management
+
+### Token Creation Service
 
 Wix uses the `client_credentials` grant with `instance_id`. [This is the modern OAuth 2.0 approach](https://dev.wix.com/docs/api-reference/app-management/oauth-2/create-access-token) - no authorization code exchange or refresh tokens needed:
 
@@ -241,8 +358,8 @@ async function createWixAccessToken(instanceId) {
     },
     body: JSON.stringify({
       grant_type: 'client_credentials',
-      client_id: process.env.WIX_APP_ID, // the integration's client id
-      client_secret: process.env.WIX_APP_SECRET, // the integration's client secret
+      client_id: process.env.WIX_APP_ID,      // Your app's client ID
+      client_secret: process.env.WIX_APP_SECRET, // Your app's client secret
       instance_id: instanceId
     })
   });
@@ -281,7 +398,7 @@ class WixTokenExpiredError extends Error {
 }
 ```
 
-### 5. Getting Valid Access Tokens
+### Getting Valid Access Tokens
 
 Since Wix tokens expire after 4 hours, you should check expiration and create new tokens as needed:
 
@@ -323,142 +440,36 @@ async function getValidAccessToken(storedConnection) {
 }
 ```
 
-### 6. Getting Site Information (Optional)
+### Getting Site Information (Optional)
 
-Use the [Token Info endpoint](https://dev.wix.com/docs/api-reference/app-management/oauth-2/token-info) to get information about the connected site:
+Use the [Site Properties API](https://dev.wix.com/docs/api-reference/business-management/site-properties/properties/get-site-properties) to get information about the connected site:
 
 ```javascript
-const WIX_TOKEN_INFO_URL = 'https://www.wixapis.com/oauth2/token-info';
+const WIX_SITE_PROPERTIES_URL = 'https://www.wixapis.com/site-properties/v4/properties';
 
 async function getWixSiteInfo(accessToken) {
-  const response = await fetch(WIX_TOKEN_INFO_URL, {
-    method: 'POST',
+  const response = await fetch(WIX_SITE_PROPERTIES_URL, {
+    method: 'GET',
     headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ token: accessToken })
+      'Authorization': accessToken
+    }
   });
   
   if (!response.ok) {
-    console.error('Failed to fetch Wix token info');
+    console.error('Failed to fetch Wix site properties');
     return null;
   }
   
   const data = await response.json();
   
   return {
-    siteDisplayName: data.site_display_name,
-    instanceId: data.instance_id,
-    // Additional fields may be available
+    siteDisplayName: data.properties?.siteDisplayName,
+    locale: data.properties?.locale,
+    language: data.properties?.language,
+    // Additional fields available: email, phone, fax, address, categories, etc.
   };
 }
 ```
-
----
-
-## Complete Express.js Example
-
-```javascript
-const express = require('express');
-const session = require('express-session');
-
-const app = express();
-
-// Session middleware (use a proper store in production)
-app.use(session({
-  secret: 'your-session-secret',
-  resave: false,
-  saveUninitialized: false
-}));
-
-const WIX_INSTALLER_URL = 'https://www.wix.com/installer/install';
-const WIX_TOKEN_URL = 'https://www.wixapis.com/oauth2/token';
-
-// Step 1: Initiate OAuth
-app.get('/wix/connect', (req, res) => {
-  // Store pending connection info
-  req.session.pendingWixConnection = {
-    userId: req.user?.id,
-    initiatedAt: Date.now()
-  };
-  
-  const installerUrl = `${WIX_INSTALLER_URL}?appId=${process.env.WIX_APP_ID}`;
-  res.redirect(installerUrl);
-});
-
-// Step 2: App URL - receives token from Wix
-app.get('/wix/install', (req, res) => {
-  const { token } = req.query;
-  
-  if (!token) {
-    return res.status(400).send('Missing token');
-  }
-  
-  const params = new URLSearchParams({
-    token: token,
-    appId: process.env.WIX_APP_ID,
-    redirectUrl: `${process.env.BASE_URL}/wix/callback`
-  });
-  
-  res.redirect(`${WIX_INSTALLER_URL}?${params.toString()}`);
-});
-
-// Step 3: Final callback
-app.get('/wix/callback', async (req, res) => {
-  const { code, instanceId } = req.query;
-  
-  if (!instanceId) {
-    return res.status(400).send('Missing instanceId');
-  }
-  
-  try {
-    // Create access token
-    const tokenResponse = await fetch(WIX_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'client_credentials',
-        client_id: process.env.WIX_APP_ID,
-        client_secret: process.env.WIX_APP_SECRET,
-        instance_id: instanceId
-      })
-    });
-    
-    const tokenData = await tokenResponse.json();
-    
-    // Store connection (implement your own storage)
-    await saveConnection({
-      instanceId,
-      accessToken: tokenData.access_token,
-      expiresAt: new Date(Date.now() + 4 * 60 * 60 * 1000),
-      userId: req.session.pendingWixConnection?.userId
-    });
-    
-    delete req.session.pendingWixConnection;
-    
-    res.send('<script>window.close()</script>Connected!');
-    
-  } catch (error) {
-    console.error('Wix OAuth error:', error);
-    res.status(500).send('Authorization failed');
-  }
-});
-
-app.listen(3000);
-```
-
----
-
-## Key Differences from Standard OAuth
-
-| Aspect | Standard OAuth | Wix OAuth |
-|--------|---------------|-----------|
-| Redirect flow | Single redirect to callback | Two-step: App URL → Installer → Callback |
-| Token parameter | N/A | Wix sends `token` to App URL, must pass back |
-| Token refresh | Refresh token grant | `client_credentials` with `instance_id` |
-| Token lifetime | Usually 1 hour | 4 hours |
-| Scopes | Per-request | Fixed in app dashboard (cannot be reduced) |
-| State parameter | Standard support | Not passed through initial redirect |
 
 ---
 
@@ -466,7 +477,7 @@ app.listen(3000);
 
 1. **Secure Instance ID Storage**: The `instance_id` is essentially a permanent credential - encrypt it at rest
 2. **HTTPS Only**: All endpoints must use HTTPS
-3. **Session Validation**: Verify pending connection exists before processing callbacks
+3. **State Parameter Encryption**: If passing sensitive data in the state, encrypt it properly
 4. **Token Expiration**: Always check token expiration before API calls
 5. **Error Handling**: Handle `WixTokenExpiredError` gracefully - prompt user to re-authorize
 
@@ -474,23 +485,39 @@ app.listen(3000);
 
 ## Troubleshooting
 
-### "Missing token" Error
-- Ensure your App URL is correctly configured in the Wix dashboard
-- The App URL must exactly match what Wix redirects to
-
 ### Token Creation Fails with 401
 - The `instance_id` may be invalid (user uninstalled the app)
 - Verify your `WIX_APP_ID` and `WIX_APP_SECRET` are correct
+
+### Missing instanceId in Callback
+- Ensure you're using the correct installer URL: `https://www.wix.com/app-installer`
+- Verify the `postInstallationUrl` is properly URL-encoded
 
 ### Permissions Not Working
 - Remember that scopes are defined in the Wix dashboard, not per-request
 - After changing permissions, existing users need to re-authorize
 
+### State Parameter Lost
+- Ensure your state is properly URL-encoded when adding to `postInstallationUrl`
+- Check that your callback correctly parses both Wix parameters and your custom parameters
+
+---
+
+## Legacy OAuth Flow
+
+For existing integrations using the legacy Custom Authentication flow (two-step redirect with token passing), see the dedicated documentation:
+
+📄 **[Legacy OAuth Flow Documentation](./LEGACY_OAUTH_FLOW.md)**
+
+The legacy flow uses `https://www.wix.com/installer/install` and requires:
+- Configuring App URL and Redirect URL in the Wix Dev Center
+- Handling an intermediate redirect with a `token` parameter
+- Manual session management for state
+
 ---
 
 ## References
 
-- [Wix Custom Authentication Documentation](https://dev.wix.com/docs/build-apps/develop-your-app/access/authentication/custom-authentication-legacy)
 - [Wix OAuth 2.0 Create Access Token](https://dev.wix.com/docs/api-reference/app-management/oauth-2/create-access-token)
+- [Wix Custom Authentication Documentation (Legacy)](https://dev.wix.com/docs/build-apps/develop-your-app/access/authentication/custom-authentication-legacy)
 - [Wix Developer Portal](https://dev.wix.com/)
-
